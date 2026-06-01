@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "dgSpecHash": "qr0pJLzJleo=",
+  "success": true,
+  "projectFilePath": "D:\\Facebook Api\\fb_api\\services\\core-service\\core-service.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\nk\\.nuget\\packages\\confluent.kafka\\2.14.0\\confluent.kafka.2.14.0.nupkg.sha512",
+    "C:\\Users\\nk\\.nuget\\packages\\librdkafka.redist\\2.14.0\\librdkafka.redist.2.14.0.nupkg.sha512",
+    "C:\\Users\\nk\\.nuget\\packages\\microsoft.aspnetcore.openapi\\9.0.15\\microsoft.aspnetcore.openapi.9.0.15.nupkg.sha512",
+    "C:\\Users\\nk\\.nuget\\packages\\microsoft.openapi\\1.6.17\\microsoft.openapi.1.6.17.nupkg.sha512"
+  ],
+  "logs": []
+}

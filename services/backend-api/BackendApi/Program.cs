@@ -2,28 +2,19 @@ using BackendApi.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Ép chạy trên cổng 3000
-builder.WebHost.UseUrls("http://*:3000");
+// Đăng ký Service
+builder.Services.AddSingleton<FacebookApiService>();
 
-// Thêm các dịch vụ cần thiết vào DI Container
-builder.Services.AddControllers();
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
-
-builder.Services.AddHttpClient();
-builder.Services.AddScoped<IFacebookService, FacebookService>();
-builder.Services.AddScoped<FacebookWebhookService>();
+// Chạy API ở port 3002 để không đụng hàng với Webhook (3001)
+builder.WebHost.UseUrls("http://*:3002");
 
 var app = builder.Build();
 
-// Cấu hình HTTP request pipeline
-if (app.Environment.IsDevelopment())
+// Tạo 1 endpoint để Postman gọi vào test
+app.MapPost("/test-retry", async (FacebookApiService fbService) =>
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
-
-app.UseAuthorization();
-app.MapControllers();
+    await fbService.SendReplyAsync("Cảm ơn bạn đã ủng hộ shop!");
+    return Results.Ok("Đã nhận lệnh kích hoạt test API");
+});
 
 app.Run();

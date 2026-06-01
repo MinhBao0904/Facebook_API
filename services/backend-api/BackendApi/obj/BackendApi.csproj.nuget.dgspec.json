@@ -44,9 +44,17 @@
         "net9.0": {
           "targetAlias": "net9.0",
           "dependencies": {
+            "Confluent.Kafka": {
+              "target": "Package",
+              "version": "[2.14.0, )"
+            },
             "Microsoft.AspNetCore.OpenApi": {
               "target": "Package",
               "version": "[9.0.15, )"
+            },
+            "Polly": {
+              "target": "Package",
+              "version": "[8.6.6, )"
             },
             "Swashbuckle.AspNetCore": {
               "target": "Package",
