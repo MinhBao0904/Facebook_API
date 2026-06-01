@@ -12,6 +12,7 @@ builder.Services.AddSwaggerGen();
 
 builder.Services.AddHttpClient();
 builder.Services.AddScoped<IFacebookService, FacebookService>();
+builder.Services.AddScoped<FacebookWebhookService>();
 
 var app = builder.Build();
 

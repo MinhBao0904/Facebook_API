@@ -33,3 +33,4 @@ D:\Facebook Api\fb_api\services\backend-api\BackendApi\obj\Debug\net9.0\refint\B
 D:\Facebook Api\fb_api\services\backend-api\BackendApi\obj\Debug\net9.0\BackendApi.pdb
 D:\Facebook Api\fb_api\services\backend-api\BackendApi\obj\Debug\net9.0\BackendApi.genruntimeconfig.cache
 D:\Facebook Api\fb_api\services\backend-api\BackendApi\obj\Debug\net9.0\ref\BackendApi.dll
+D:\Facebook Api\fb_api\services\backend-api\BackendApi\obj\Debug\net9.0\BackendApi.sourcelink.json
