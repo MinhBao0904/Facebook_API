@@ -1,125 +1,159 @@
-using Microsoft.AspNetCore.Mvc;
-using System.IO;
-using System.Text;
-using System.Threading.Tasks;
 using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Microsoft.AspNetCore.Mvc;
 using WebhookService.Services;
 
 namespace WebhookService.Controllers
 {
     [ApiController]
-    [Route("[controller]")] // Đường dẫn sẽ là /webhook
+    [Route("[controller]")]
     public class WebhookController : ControllerBase
     {
         private readonly KafkaProducerService _kafkaProducer;
         private readonly IConfiguration _config;
+        private readonly ILogger<WebhookController> _logger;
 
-        public WebhookController(KafkaProducerService kafkaProducer, IConfiguration config)
+        public WebhookController(KafkaProducerService kafkaProducer, IConfiguration config, ILogger<WebhookController> logger)
         {
             _kafkaProducer = kafkaProducer;
             _config = config;
+            _logger = logger;
         }
 
-        // BƯỚC 1: XÁC MINH WEBHOOK (GET)
         [HttpGet]
-        public IActionResult VerifyWebhook([FromQuery(Name = "hub.mode")] string mode,
-                                           [FromQuery(Name = "hub.challenge")] string challenge,
-                                           [FromQuery(Name = "hub.verify_token")] string token)
+        public IActionResult VerifyWebhook(
+            [FromQuery(Name = "hub.mode")] string mode,
+            [FromQuery(Name = "hub.challenge")] string challenge,
+            [FromQuery(Name = "hub.verify_token")] string token)
         {
-            // Đọc Verify Token từ appsettings.json
-            string myVerifyToken = _config["Facebook:VerifyToken"] ?? "my_secret_verify_token_123"; 
-
-            if (mode == "subscribe" && token == myVerifyToken)
+            var verifyToken = _config["Facebook:VerifyToken"];
+            if (mode == "subscribe" && !string.IsNullOrWhiteSpace(verifyToken) && token == verifyToken)
             {
-                Console.WriteLine("✅ Xác minh Webhook thành công!");
-                return Ok(challenge); // Bắt buộc trả về challenge bằng HTTP 200
+                _logger.LogInformation("Facebook webhook verification succeeded.");
+                return Content(challenge, "text/plain");
             }
-            
-            Console.WriteLine("❌ Xác minh Webhook thất bại! Sai Token.");
+
+            _logger.LogWarning("Facebook webhook verification failed.");
             return Forbid();
         }
 
-        // BƯỚC 2: NHẬN SỰ KIỆN TỪ FACEBOOK (POST)
         [HttpPost]
         public async Task<IActionResult> ReceiveWebhook()
         {
-            try
+            using var reader = new StreamReader(Request.Body, Encoding.UTF8);
+            var rawBody = await reader.ReadToEndAsync();
+
+            if (!VerifyWebhookSignature(rawBody))
             {
-                // Đọc toàn bộ dữ liệu thô (raw JSON) Facebook gửi đến
-                using StreamReader reader = new StreamReader(Request.Body, Encoding.UTF8);
-                string rawBody = await reader.ReadToEndAsync();
-
-                // KIỂM TRA CHỮ KÝ TỬ FACEBOOK (Tùy chọn nhưng KHUYÊN DÙNG)
-                // if (!VerifyWebhookSignature(rawBody))
-                // {
-                //     Console.WriteLine("❌ Chữ ký Webhook không hợp lệ! Có thể không phải từ Facebook.");
-                //     return Unauthorized();
-                // }
-
-                Console.WriteLine("\n==================================================");
-                Console.WriteLine("📥 CÓ DỮ LIỆU TỪ FACEBOOK GỬI VỀ:");
-                Console.WriteLine(rawBody);
-                Console.WriteLine("==================================================\n");
-
-                // Đẩy vào Kafka
-                await _kafkaProducer.ProduceAsync("raw_events", rawBody);
-                Console.WriteLine("✅ Đã đẩy event vào Kafka topic raw_events");
-
-                // Facebook yêu cầu phải trả về "200 OK" trong vòng 20 giây
-                return Ok("EVENT_RECEIVED");
+                return Unauthorized(new { success = false, errorCode = 401, message = "Invalid Facebook webhook signature." });
             }
-            catch (Exception ex)
+
+            var normalizedEvents = NormalizeEvents(rawBody);
+            foreach (var normalizedEvent in normalizedEvents)
             {
-                Console.WriteLine($"❌ Lỗi xử lý Webhook: {ex.Message}");
-                // Vẫn nên trả về 200 OK để Facebook không gửi lại liên tục khi code mình lỗi
-                return Ok();
+                await _kafkaProducer.ProduceAsync(
+                    _config["Kafka:TopicRawEvents"] ?? "raw_events",
+                    JsonSerializer.Serialize(normalizedEvent));
             }
+
+            _logger.LogInformation("Received Facebook webhook. normalized_event_count={Count}", normalizedEvents.Count);
+            return Ok("EVENT_RECEIVED");
         }
 
-        // Xác thực chữ ký X-Hub-Signature từ Facebook
         private bool VerifyWebhookSignature(string body)
         {
-            try
+            var appSecret = _config["Facebook:AppSecret"];
+            if (string.IsNullOrWhiteSpace(appSecret))
             {
-                // Lấy App Secret từ config
-                string appSecret = _config["Facebook:AppSecret"];
-                if (string.IsNullOrEmpty(appSecret))
-                {
-                    Console.WriteLine("⚠️ Cảnh báo: AppSecret không được cấu hình!");
-                    return true; // Cho pass nếu không có AppSecret (tạm thời)
-                }
-
-                // Lấy X-Hub-Signature header từ request
-                if (!Request.Headers.TryGetValue("X-Hub-Signature-256", out var signature))
-                {
-                    Console.WriteLine("⚠️ Cảnh báo: Header X-Hub-Signature-256 không tìm thấy!");
-                    return false;
-                }
-
-                // Tính HMAC SHA256
-                using (var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(appSecret)))
-                {
-                    string hash = "sha256=" + BitConverter.ToString(hmac.ComputeHash(Encoding.UTF8.GetBytes(body)))
-                        .Replace("-", "")
-                        .ToLower();
-
-                    bool isValid = hash == signature.ToString().ToLower();
-                    if (isValid)
-                    {
-                        Console.WriteLine("✅ Chữ ký Webhook hợp lệ - Từ Facebook");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"❌ Chữ ký không hợp lệ. Kỳ vọng: {hash}, Nhận: {signature}");
-                    }
-                    return isValid;
-                }
+                _logger.LogWarning("Facebook AppSecret is missing. Signature verification is disabled for local development.");
+                return true;
             }
-            catch (Exception ex)
+
+            if (!Request.Headers.TryGetValue("X-Hub-Signature-256", out var providedSignature))
             {
-                Console.WriteLine($"❌ Lỗi xác thực chữ ký: {ex.Message}");
+                _logger.LogWarning("Missing X-Hub-Signature-256 header.");
                 return false;
             }
+
+            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(appSecret));
+            var hashBytes = hmac.ComputeHash(Encoding.UTF8.GetBytes(body));
+            var expected = "sha256=" + Convert.ToHexString(hashBytes).ToLowerInvariant();
+            var actual = providedSignature.ToString().Trim().ToLowerInvariant();
+
+            var expectedBytes = Encoding.UTF8.GetBytes(expected);
+            var actualBytes = Encoding.UTF8.GetBytes(actual);
+
+            return expectedBytes.Length == actualBytes.Length &&
+                   CryptographicOperations.FixedTimeEquals(expectedBytes, actualBytes);
+        }
+
+        private static List<object> NormalizeEvents(string rawBody)
+        {
+            var events = new List<object>();
+            using var document = JsonDocument.Parse(rawBody);
+            var root = document.RootElement;
+
+            if (!root.TryGetProperty("entry", out var entries) || entries.ValueKind != JsonValueKind.Array)
+            {
+                return events;
+            }
+
+            foreach (var entry in entries.EnumerateArray())
+            {
+                var pageId = entry.TryGetProperty("id", out var entryId) ? entryId.GetString() : null;
+
+                if (!entry.TryGetProperty("changes", out var changes) || changes.ValueKind != JsonValueKind.Array)
+                {
+                    continue;
+                }
+
+                foreach (var change in changes.EnumerateArray())
+                {
+                    var field = change.TryGetProperty("field", out var fieldElement) ? fieldElement.GetString() : "unknown";
+                    if (!change.TryGetProperty("value", out var value))
+                    {
+                        continue;
+                    }
+
+                    var commentId = GetString(value, "comment_id") ?? GetString(value, "id");
+                    var message = GetString(value, "message") ?? GetString(value, "text") ?? "";
+                    var userId = GetNestedString(value, "from", "id") ?? GetString(value, "sender_id") ?? "unknown";
+                    var verb = GetString(value, "verb") ?? "add";
+
+                    events.Add(new
+                    {
+                        event_id = commentId ?? Guid.NewGuid().ToString("N"),
+                        event_type = field,
+                        page_id = pageId,
+                        comment_id = commentId,
+                        user_id = userId,
+                        message,
+                        verb,
+                        received_at = DateTimeOffset.UtcNow,
+                        raw = JsonSerializer.Deserialize<object>(value.GetRawText())
+                    });
+                }
+            }
+
+            return events;
+        }
+
+        private static string? GetString(JsonElement element, string propertyName)
+        {
+            return element.TryGetProperty(propertyName, out var value) && value.ValueKind != JsonValueKind.Null
+                ? value.ToString()
+                : null;
+        }
+
+        private static string? GetNestedString(JsonElement element, string objectName, string propertyName)
+        {
+            if (!element.TryGetProperty(objectName, out var nested) || nested.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            return GetString(nested, propertyName);
         }
     }
 }

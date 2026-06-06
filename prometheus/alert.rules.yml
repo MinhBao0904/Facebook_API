@@ -1,0 +1,11 @@
+groups:
+  - name: facebook-api-pipeline
+    rules:
+      - alert: DeadLetterQueueReceivedMessages
+        expr: increase(kafka_topic_partition_current_offset{topic="dead_letter"}[1m]) > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead letter topic received messages"
+          description: "The Facebook automation pipeline moved messages to Kafka topic dead_letter."

@@ -1,8 +1,8 @@
-using Confluent.Kafka;
-using System.Text.Json;
 using System.Collections.Concurrent;
+using System.Net.Http.Json;
+using System.Text.Json;
+using Confluent.Kafka;
 using CoreService.Models;
-using System.Net.Http; // Đã thêm thư viện này để gọi API
 
 namespace CoreService.Services
 {
@@ -10,106 +10,190 @@ namespace CoreService.Services
     {
         private readonly SentimentAnalysisService _aiService;
         private readonly IConfiguration _config;
-        
-        // GIẢ LẬP DATABASE LƯU ID ĐỂ CHECK IDEMPOTENT
-        private static readonly ConcurrentDictionary<string, bool> _processedComments = new();
+        private readonly IHttpClientFactory _httpClientFactory;
+        private readonly ILogger<KafkaConsumerService> _logger;
+        private readonly ConcurrentDictionary<string, DateTimeOffset> _processedEvents = new();
+        private readonly ConcurrentDictionary<string, Queue<DateTimeOffset>> _userEventWindows = new();
 
-        public KafkaConsumerService(SentimentAnalysisService aiService, IConfiguration config)
+        public KafkaConsumerService(
+            SentimentAnalysisService aiService,
+            IConfiguration config,
+            IHttpClientFactory httpClientFactory,
+            ILogger<KafkaConsumerService> logger)
         {
             _aiService = aiService;
             _config = config;
+            _httpClientFactory = httpClientFactory;
+            _logger = logger;
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            var config = new ConsumerConfig
+            var consumerConfig = new ConsumerConfig
             {
                 BootstrapServers = _config["Kafka:BootstrapServers"] ?? "localhost:9092",
-                GroupId = "core-service-group",
-                AutoOffsetReset = AutoOffsetReset.Earliest
+                GroupId = _config["Kafka:GroupId"] ?? "core-service-group",
+                AutoOffsetReset = AutoOffsetReset.Earliest,
+                EnableAutoCommit = false
             };
 
-            using var consumer = new ConsumerBuilder<Ignore, string>(config).Build();
-            consumer.Subscribe("raw_events");
-
-            Console.WriteLine("🚀 [Core Service] Đang lắng nghe dữ liệu từ Kafka topic 'raw_events'...");
-
-            try
+            using var consumer = new ConsumerBuilder<Ignore, string>(consumerConfig).Build();
+            using var dlqProducer = new ProducerBuilder<Null, string>(new ProducerConfig
             {
-                while (!stoppingToken.IsCancellationRequested)
+                BootstrapServers = consumerConfig.BootstrapServers,
+                Acks = Acks.All
+            }).Build();
+
+            var rawTopic = _config["Kafka:TopicRawEvents"] ?? "raw_events";
+            consumer.Subscribe(rawTopic);
+            _logger.LogInformation("Core Service is consuming Kafka topic {Topic}.", rawTopic);
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                ConsumeResult<Ignore, string>? result = null;
+
+                try
                 {
-                    var consumeResult = consumer.Consume(stoppingToken);
-                    string rawJson = consumeResult.Message.Value;
-
-                    try
+                    result = consumer.Consume(stoppingToken);
+                    await ProcessMessageAsync(result.Message.Value, dlqProducer, stoppingToken);
+                    consumer.Commit(result);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to process Kafka message.");
+                    if (result != null)
                     {
-                        var fbEvent = JsonSerializer.Deserialize<FacebookWebhookEvent>(rawJson);
-                        
-                        // Lấy ra comment_id và nội dung
-                        var valueNode = fbEvent?.entry?.FirstOrDefault()?.changes?.FirstOrDefault()?.value;
-                        
-                        if (valueNode != null && valueNode.verb == "add" && !string.IsNullOrEmpty(valueNode.comment_id))
-                        {
-                            string commentId = valueNode.comment_id;
-                            string message = valueNode.message;
-
-                            Console.WriteLine("\n--------------------------------------------------");
-                            Console.WriteLine($"📥 Nhận comment mới: '{message}' (ID: {commentId})");
-
-                            // ==========================================
-                            // 1. KIỂM TRA IDEMPOTENT (CHỐNG TRÙNG LẶP)
-                            // ==========================================
-                            if (_processedComments.ContainsKey(commentId))
-                            {
-                                Console.WriteLine($"⚠️ [Idempotent] Bỏ qua comment {commentId} vì ĐÃ ĐƯỢC XỬ LÝ TRƯỚC ĐÓ. (Tránh gửi lệnh 2 lần)");
-                                Console.WriteLine("--------------------------------------------------");
-                                continue; // Chặn lại, không chạy tiếp
-                            }
-
-                            // Đánh dấu là đã xử lý
-                            _processedComments.TryAdd(commentId, true);
-
-                            // ==========================================
-                            // 2. GỌI AI PHÂN TÍCH CẢM XÚC
-                            // ==========================================
-                            var (sentiment, action, replyMsg) = _aiService.Analyze(message);
-                            
-                            Console.WriteLine($"🤖 [AI] Phân loại cảm xúc: {sentiment}");
-                            Console.WriteLine($"⚡ [Hành động] Quyết định: {action}");
-                            if (!string.IsNullOrEmpty(replyMsg))
-                            {
-                                Console.WriteLine($"💬 [Nội dung phản hồi]: {replyMsg}");
-                            }
-                            
-                            // ==========================================
-                            // 3. ĐẨY LỆNH SANG BACKEND API ĐỂ GỬI FACEBOOK
-                            // ==========================================
-                            try 
-                            {
-                                using var http = new HttpClient();
-                                // Gọi sang cổng 3002 của Backend API
-                                await http.PostAsync("http://localhost:3002/test-retry", null);
-                                Console.WriteLine("🚀 [Pipeline] Đã chuyển lệnh sang Backend API (Port 3002) để xử lý bảo vệ!");
-                            }
-                            catch (Exception httpEx)
-                            {
-                                Console.WriteLine($"❌ [Lỗi kết nối] Không thể gọi sang Backend API: {httpEx.Message}");
-                            }
-                            
-                            Console.WriteLine("✅ Xử lý thành công!");
-                            Console.WriteLine("--------------------------------------------------");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"❌ Lỗi parse JSON: {ex.Message}");
+                        await PublishDeadLetterAsync(dlqProducer, result.Message.Value, "core_processing_failed", ex.Message, stoppingToken);
+                        consumer.Commit(result);
                     }
                 }
             }
-            catch (OperationCanceledException)
+
+            consumer.Close();
+        }
+
+        private async Task ProcessMessageAsync(string rawJson, IProducer<Null, string> dlqProducer, CancellationToken cancellationToken)
+        {
+            var fbEvent = JsonSerializer.Deserialize<NormalizedFacebookEvent>(rawJson);
+            if (fbEvent == null || fbEvent.verb != "add" || string.IsNullOrWhiteSpace(fbEvent.comment_id))
             {
-                consumer.Close();
+                _logger.LogInformation("Skipping unsupported event: {Payload}", rawJson);
+                return;
             }
+
+            var commandId = fbEvent.event_id ?? fbEvent.comment_id;
+            if (!_processedEvents.TryAdd(commandId, DateTimeOffset.UtcNow))
+            {
+                _logger.LogWarning("Idempotent skip. command_id={CommandId}", commandId);
+                return;
+            }
+
+            if (IsRateLimited(fbEvent.user_id ?? "unknown"))
+            {
+                _logger.LogWarning("User {UserId} is rate limited. Event moved to pending_review. command_id={CommandId}", fbEvent.user_id, commandId);
+                return;
+            }
+
+            var analysis = _aiService.Analyze(fbEvent.message);
+            _logger.LogInformation(
+                "Event processed. command_id={CommandId} comment_id={CommentId} sentiment={Sentiment} intent={Intent} action={Action}",
+                commandId,
+                fbEvent.comment_id,
+                analysis.Sentiment,
+                analysis.Intent,
+                analysis.Action);
+
+            if (analysis.Action == "skip")
+            {
+                return;
+            }
+
+            if (analysis.Action == "review")
+            {
+                _logger.LogWarning("Severe spam requires manual review. command_id={CommandId}", commandId);
+                await SendAutomationCommandAsync("hide", fbEvent.comment_id, commandId, "", "severe_spam_review", cancellationToken);
+                return;
+            }
+
+            if (analysis.Action == "hide")
+            {
+                await SendAutomationCommandAsync("hide", fbEvent.comment_id, commandId, "", analysis.Intent, cancellationToken);
+                return;
+            }
+
+            if (analysis.Action == "reply")
+            {
+                await SendAutomationCommandAsync("reply", fbEvent.comment_id, commandId, analysis.ReplyMessage, analysis.Intent, cancellationToken);
+            }
+        }
+
+        private bool IsRateLimited(string userId)
+        {
+            var now = DateTimeOffset.UtcNow;
+            var window = _userEventWindows.GetOrAdd(userId, _ => new Queue<DateTimeOffset>());
+
+            lock (window)
+            {
+                while (window.Count > 0 && now - window.Peek() > TimeSpan.FromMinutes(1))
+                {
+                    window.Dequeue();
+                }
+
+                window.Enqueue(now);
+                return window.Count > 20;
+            }
+        }
+
+        private async Task SendAutomationCommandAsync(
+            string action,
+            string commentId,
+            string commandId,
+            string replyMessage,
+            string reason,
+            CancellationToken cancellationToken)
+        {
+            var client = _httpClientFactory.CreateClient("backend-api");
+            var payload = new
+            {
+                commandId,
+                commentId,
+                action,
+                replyMessage,
+                reason
+            };
+
+            var endpoint = action == "reply" ? "automation/reply" : "automation/hide";
+            var response = await client.PostAsJsonAsync(endpoint, payload, cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                throw new InvalidOperationException($"Backend automation failed. status={(int)response.StatusCode}, body={body}");
+            }
+        }
+
+        private async Task PublishDeadLetterAsync(
+            IProducer<Null, string> producer,
+            string originalPayload,
+            string errorType,
+            string reason,
+            CancellationToken cancellationToken)
+        {
+            var topic = _config["Kafka:TopicDeadLetter"] ?? "dead_letter";
+            var payload = JsonSerializer.Serialize(new
+            {
+                error_type = errorType,
+                reason,
+                original_payload = originalPayload,
+                failed_at = DateTimeOffset.UtcNow
+            });
+
+            await producer.ProduceAsync(topic, new Message<Null, string> { Value = payload }, cancellationToken);
+            _logger.LogCritical("Published failed message to DLQ topic {Topic}.", topic);
         }
     }
 }

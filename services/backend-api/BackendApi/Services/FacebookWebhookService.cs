@@ -84,7 +84,11 @@ namespace BackendApi.Services
                                 var fieldList = new List<string>();
                                 foreach (var field in fields.EnumerateArray())
                                 {
-                                    fieldList.Add(field.GetString());
+                                    var fieldName = field.GetString();
+                                    if (!string.IsNullOrWhiteSpace(fieldName))
+                                    {
+                                        fieldList.Add(fieldName);
+                                    }
                                 }
                                 _logger.LogInformation($"✅ Subscribed fields hiện tại: {string.Join(", ", fieldList)}");
                                 return fieldList;
